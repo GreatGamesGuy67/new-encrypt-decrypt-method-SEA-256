@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SEA-256 Core Pipeline</title>
+    <title>SEA-256 Symmetric Core Engine</title>
     <style>
         body { font-family: monospace; background: #0c0f12; color: #ced4da; padding: 20px; }
         .container { max-width: 800px; margin: 0 auto; }
@@ -18,7 +18,7 @@
 <body>
     <div class="container">
 
-        <h2>SEA-256 MASTER ENGINE PIPELINE</h2>
+        <h2>SEA-256 MASTER ENGINE PIPELINE (FIXED ARCHITECTURE)</h2>
         
         <div class="group">
             <label>Input Payload / Ciphertext Hex</label>
@@ -53,11 +53,17 @@
         const MARKERS = [3, 7, 13, 19];
         const MOD128 = 1n << 128n;
 
+        // Crash-proof Ring & Field Operator to solve Negative Remainder Pitfall
+        function safeMod(val, mod) {
+            let res = val % mod;
+            return res < 0n ? res + mod : res;
+
+        }
+
         function gcd(a, b) {
             while (b !== 0n) { let t = b; b = a % b; a = t; }
             return a;
         }
-
 
         function modInverse(a, m) {
             let m0 = m, y = 0n, x = 1n;
@@ -72,15 +78,14 @@
             return x < 0n ? x + m0 : x;
         }
 
-        // --- BIT FIELD UTILITIES ---
-        function getBit(arr, idx) { return (arr[Math.floor(idx / 8)] >> (7 - (idx % 8))) & 1; }
-        function setBit(arr, idx, val) {
-            const bIdx = Math.floor(idx / 8), bit = 7 - (idx % 8);
-            if (val === 1) arr[bIdx] |= (1 << bit); else arr[bIdx] &= ~(1 << bit);
-        }
 
+        // --- BIT Field AND NIBBLE UTILITIES ---
+        function getBit(arr, idx) { return (arr[Math.floor(idx / 8)] >> (7 - (idx % 8))) & 1; }
         function toggleBit(arr, idx) { arr[Math.floor(idx / 8)] ^= (1 << (7 - (idx % 8))); }
         
+        function rotateLeft4(nibble) { return ((nibble << 1) & 0xF) | (nibble >> 3); }
+        function rotateRight4(nibble) { return (nibble >> 1) | ((nibble << 3) & 0xF); }
+
         function getBlock128(arr, bIdx) {
             let val = 0n; const start = bIdx * 16;
             for (let i = 0; i < 16; i++) val = (val << 8n) | BigInt(arr[start + i] || 0);
@@ -93,12 +98,12 @@
 
         function getShuffleMap(seed, len = 128) {
             let curr = seed % 2147483647n; if (curr === 0n) curr = 123456789n;
+
             const next = () => { curr = (curr * 48271n) % 2147483647n; return Number(curr); };
             let arr = Array.from({length: len}, (_, i) => i);
             for (let i = len - 1; i > 0; i--) {
                 const j = next() % (i + 1);
                 let t = arr[i]; arr[i] = arr[j]; arr[j] = t;
-
             }
             return arr;
         }
@@ -122,10 +127,9 @@
         }
 
         // ====================================================================
-        // STEP ENTRY POINT: ENCRYPT ENGINE PIPELINE
+        // PIPELINE FUNCTION: ENCRYPT
         // ====================================================================
         async function encryptSEA256(payloadStr, keyStr, ivBytes, pepperStr) {
-
             const encoder = new TextEncoder();
             let keyBytes = new Uint8Array(32); keyBytes.set(encoder.encode(keyStr).slice(0, 32));
             
@@ -141,11 +145,11 @@
             if (gcd(pepperBig, M) !== 1n || pepperBig === 0n) pepperBig += 1n;
 
             let ivInt = 0n; for(let i=0; i<16; i++) ivInt = (ivInt << 8n) | BigInt(ivBytes[i]);
+
             let keyInt = 0n; for(let i=0; i<32; i++) keyInt = (keyInt << 8n) | BigInt(keyBytes[i]);
             let keySlices = [keyInt >> 128n, keyInt & ((1n << 128n) - 1n)];
 
             const totalBits = buf.length * 8;
-
             const ivBits = []; for(let i=0; i<16; i++) for(let b=7; b>=0; b--) ivBits.push((ivBytes[i] >> b) & 1);
             const controlBits = []; for(let i=0; i<32; i++) for(let b=7; b>=0; b--) controlBits.push(((keyBytes[i] ^ ivBytes[i % 16]) >> b) & 1);
 
@@ -154,58 +158,61 @@
             const ivKeyInt128 = keySlices[0] ^ ivInt;
 
             for (let r = 0; r < 8; r++) {
-                // Step 1
+                // Step 1: Forward Inversion Check
                 for (let i = 0; i < totalBits; i++) if (MARKERS.includes(i % 22) && ivBits[i % 128] === 1) toggleBit(buf, i);
                 
-                // Step 2
+                // Step 2: Key-Dependent Pepper Shift (Fixed Asymmetry)
                 for (let b = 0; b < numBlocks16; b++) {
-                    const shift = Number(((pepperBig * ivKeyInt128) * BigInt(b + 1)) % 22n);
-                    for (let i = 0; i < 128; i++) if (MARKERS.includes((i % 22 + shift) % 22)) toggleBit(buf, b * 128 + i);
+                    const shift = Number(safeMod((pepperBig * ivKeyInt128) * BigInt(b + 1), 22n));
+                    for (let i = 0; i < 128; i++) if (MARKERS.includes(((i % 22) + shift) % 22)) toggleBit(buf, b * 128 + i);
+
                 }
                 
-                // Steps 3 & 4
+                // Steps 3 & 4: Modular Field Calculation
                 for (let b = 0; b < numBlocks16; b++) {
-
                     let X = getBlock128(buf, b);
-                    let Y = ((X * pepperBig) + (keySlices[b % 2] ^ ivInt)) % M;
+                    let Y = safeMod((X * pepperBig) + (keySlices[b % 2] ^ ivInt), M);
                     setBlock128(buf, b, (~Y) & (MOD128 - 1n));
                 }
                 
-                // Step 5
+                // Step 5: Deterministic Byte Shuffle
                 for (let b = 0; b < numBlocks128; b++) {
                     const map = getShuffleMap(pepperBig + ivInt + BigInt(b + r), 128);
                     const chunk = buf.slice(b * 128, (b + 1) * 128);
                     for (let i = 0; i < 128; i++) buf[b * 128 + map[i]] = chunk[i];
                 }
                 
-                // Step 6
+                // Step 6: Key Matrix Mix & Bit Injection
                 for (let b = 0; b < numBlocks16; b++) {
                     let d = getBlock128(buf, b);
-                    let m = (d + keySlices[1] - pepperBig) % MOD128;
-                    setBlock128(buf, b, m < 0n ? m + MOD128 : m);
-                    toggleBit(buf, b * 128 + Number((BigInt(keyBytes[b % 32] ^ ivBytes[b % 16]) * pepperBig) % 128n));
-                }
 
+                    let m = safeMod(d + keySlices[1] - pepperBig, MOD128);
+                    setBlock128(buf, b, m);
+                    let targetBitIndex = b * 128 + Number(safeMod(BigInt(keyBytes[b % 32] ^ ivBytes[b % 16]) * pepperBig, 128n));
+                    toggleBit(buf, targetBitIndex);
+                }
                 
-                // Step 7
+                // Step 7: Avalanche Execution Loop
                 const pos = getAvalanchePositions(keyInt ^ ivInt ^ BigInt(r), totalBits, 128);
                 for (let p = 0; p < pos.length; p++) {
                     let val = BigInt(getBit(buf, pos[p])) + pepperBig;
-                    for (let l = 0; l < 300; l++) val = (~(((val ^ pepperBig) * 8n) + pepperBig)) & (MOD128 - 1n);
+                    for (let l = 0; l < 300; l++) val = safeMod(~(((val ^ pepperBig) * 8n) + pepperBig), MOD128);
                     const mBytes = new Uint8Array(16); let tv = val;
                     for (let i = 15; i >= 0; i--) { mBytes[i] = Number(tv & 0xFFn); tv >>= 8n; }
                     const startByte = Math.floor(pos[p] / 128) * 16;
                     for (let i = 0; i < 16; i++) buf[startByte + i] ^= mBytes[i];
                 }
                 
-                // Step 8
+                // Step 8: Intervallic Shift Gate (Reversible Nibble-based Realignment)
                 const interval = pepperBig * 3n;
-                for (let i = 0; i < totalBits; i += 4) {
-                    const ctrl = controlBits[Number((BigInt(i) * interval) % BigInt(controlBits.length))];
-                    let b0 = getBit(buf, i), b1 = getBit(buf, i+1), b2 = getBit(buf, i+2), b3 = getBit(buf, i+3);
-                    if (ctrl === 0) { setBit(buf, i, b1); setBit(buf, i+1, b2); setBit(buf, i+2, b3); setBit(buf, i+3, b0); }
-                    else { setBit(buf, i, b3); setBit(buf, i+1, b0); setBit(buf, i+2, b1); setBit(buf, i+3, b2); }
 
+                for (let i = 0; i < buf.length; i++) {
+                    const bitIdx = i * 8;
+                    const ctrl = controlBits[Number(safeMod(BigInt(bitIdx) * interval, BigInt(controlBits.length)))];
+                    let byteVal = buf[i]; let high = (byteVal >> 4) & 0xF; let low = byteVal & 0xF;
+                    if (ctrl === 0) { high = rotateLeft4(high); low = rotateLeft4(low); }
+                    else { high = rotateRight4(high); low = rotateRight4(low); }
+                    buf[i] = (high << 4) | low;
                 }
             }
 
@@ -216,16 +223,19 @@
         }
 
         // ====================================================================
-        // STEP ENTRY POINT: DECRYPT ENGINE PIPELINE
+        // PIPELINE FUNCTION: DECRYPT
         // ====================================================================
+
         async function decryptSEA256(combinedHex, keyStr, pepperStr) {
             const rawHex = combinedHex.trim().replace(/^0x/i, '');
             if (rawHex.length === 0) throw new Error('No input provided to decrypt');
             if (rawHex.length % 2 !== 0) throw new Error('Hex input length must be even');
+            if (rawHex.length < 96) throw new Error('Input too short: expect at least 96 hex chars (32 HMAC + 16 IV)');
 
             const fullBuf = new Uint8Array(rawHex.length / 2);
             for (let i = 0; i < fullBuf.length; i++) fullBuf[i] = parseInt(rawHex.substr(i * 2, 2), 16);
 
+            // verify structure
             if (fullBuf.length < 48) throw new Error('Input is too short to contain HMAC + IV + ciphertext');
 
             const encoder = new TextEncoder();
@@ -250,72 +260,90 @@
             let keyInt = 0n; for(let i=0; i<32; i++) keyInt = (keyInt << 8n) | BigInt(keyBytes[i]);
             let keySlices = [keyInt >> 128n, keyInt & ((1n << 128n) - 1n)];
 
+
             const totalBits = buf.length * 8;
             const ivBits = []; for(let i=0; i<16; i++) for(let b=7; b>=0; b--) ivBits.push((ivBytes[i] >> b) & 1);
             const controlBits = []; for(let i=0; i<32; i++) for(let b=7; b>=0; b--) controlBits.push(((keyBytes[i] ^ ivBytes[i % 16]) >> b) & 1);
 
             const numBlocks16 = Math.floor(buf.length / 16);
             const numBlocks128 = Math.floor(buf.length / 128);
-
             const ivKeyInt128 = keySlices[0] ^ ivInt;
 
             for (let r = 7; r >= 0; r--) {
-                // Step 8 Reverse
+                // Step 8 Reverse: Reverse processing direction & alternate rotations
                 const interval = pepperBig * 3n;
-                for (let i = totalBits - 4; i >= 0; i -= 4) {
-                    const ctrl = controlBits[Number((BigInt(i) * interval) % BigInt(controlBits.length))];
-                    let b0 = getBit(buf, i), b1 = getBit(buf, i+1), b2 = getBit(buf, i+2), b3 = getBit(buf, i+3);
-                    if (ctrl === 0) { setBit(buf, i, b3); setBit(buf, i+1, b0); setBit(buf, i+2, b1); setBit(buf, i+3, b2); }
-                    else { setBit(buf, i, b0); setBit(buf, i+1, b1); setBit(buf, i+2, b2); setBit(buf, i+3, b3); }
+                for (let i = buf.length - 1; i >= 0; i--) {
+                    const bitIdx = i * 8;
+                    const ctrl = controlBits[Number(safeMod(BigInt(bitIdx) * interval, BigInt(controlBits.length)))];
+                    let byteVal = buf[i]; let high = (byteVal >> 4) & 0xF; let low = byteVal & 0xF;
+                    if (ctrl === 0) { high = rotateRight4(high); low = rotateRight4(low); }
+                    else { high = rotateLeft4(high); low = rotateLeft4(low); }
+                    buf[i] = (high << 4) | low;
                 }
 
-                // Step 7 Reverse
+
+                // Step 7 Reverse: Dual Candidate Verification Engine to resolve Plaintext Trap
                 const pos = getAvalanchePositions(keyInt ^ ivInt ^ BigInt(r), totalBits, 128);
                 for (let p = pos.length - 1; p >= 0; p--) {
-                    let val = BigInt(getBit(buf, pos[p])) + pepperBig;
-                    for (let l = 0; l < 300; l++) val = (~(((val ^ pepperBig) * 8n) + pepperBig)) & (MOD128 - 1n);
-                    const mBytes = new Uint8Array(16); let tv = val;
-                    for (let i = 15; i >= 0; i--) { mBytes[i] = Number(tv & 0xFFn); tv >>= 8n; }
+                    const targetBitPos = pos[p];
+                    const startByte = Math.floor(targetBitPos / 128) * 16;
+                    const bitOffsetInBlock = targetBitPos % 128;
+                    const targetByteIdx = startByte + Math.floor(bitOffsetInBlock / 8);
+                    const targetBitIdxInByte = 7 - (bitOffsetInBlock % 8);
+                    const cipherBit = (buf[targetByteIdx] >> targetBitIdxInByte) & 1;
+                    
+                    let finalMaskBytes = new Uint8Array(16);
+                    for (let candidateB = 0; candidateB <= 1; candidateB++) {
+                        let val = BigInt(candidateB) + pepperBig;
+                        for (let l = 0; l < 300; l++) val = safeMod(~(((val ^ pepperBig) * 8n) + pepperBig), MOD128);
+                        const mBytes = new Uint8Array(16); let tv = val;
+                        for (let i = 15; i >= 0; i--) { mBytes[i] = Number(tv & 0xFFn); tv >>= 8n; }
+                        
+                        const maskBit = (mBytes[Math.floor(bitOffsetInBlock / 8)] >> targetBitIdxInByte) & 1;
+                        if ((candidateB ^ maskBit) === cipherBit) {
 
-                    const startByte = Math.floor(pos[p] / 128) * 16;
-                    for (let i = 0; i < 16; i++) buf[startByte + i] ^= mBytes[i];
+                            finalMaskBytes = mBytes;
+                            break;
+                        }
+                    }
+                    for (let i = 0; i < 16; i++) buf[startByte + i] ^= finalMaskBytes[i];
                 }
 
-                // Step 6 Reverse
+                // Step 6 Reverse: Symmetric step order rollback
                 for (let b = 0; b < numBlocks16; b++) {
-                    toggleBit(buf, b * 128 + Number((BigInt(keyBytes[b % 32] ^ ivBytes[b % 16]) * pepperBig) % 128n));
+                    let targetBitIndex = b * 128 + Number(safeMod(BigInt(keyBytes[b % 32] ^ ivBytes[b % 16]) * pepperBig, 128n));
+                    toggleBit(buf, targetBitIndex);
                     let m = getBlock128(buf, b);
-                    let d = (m - keySlices[1] + pepperBig) % MOD128;
-                    setBlock128(buf, b, d < 0n ? d + MOD128 : d);
+                    let d = safeMod(m - keySlices[1] + pepperBig, MOD128);
+                    setBlock128(buf, b, d);
                 }
 
-                // Step 5 Reverse
+                // Step 5 Reverse: Gather matrix mapping loop
                 for (let b = numBlocks128 - 1; b >= 0; b--) {
                     const map = getShuffleMap(pepperBig + ivInt + BigInt(b + r), 128);
+
                     const chunk = buf.slice(b * 128, (b + 1) * 128);
                     for (let i = 0; i < 128; i++) buf[b * 128 + i] = chunk[map[i]];
                 }
 
-
-                // Steps 3 & 4 Reverse
+                // Steps 3 & 4 Reverse: Field element calculation
                 for (let b = 0; b < numBlocks16; b++) {
                     let fb = getBlock128(buf, b);
                     let Y = (~fb) & (MOD128 - 1n);
-                    let term = (Y - (keySlices[b % 2] ^ ivInt)) % M;
-                    if (term < 0n) term += M;
-                    setBlock128(buf, b, (term * invPepper) % M);
+                    let term = safeMod(Y - (keySlices[b % 2] ^ ivInt), M);
+                    setBlock128(buf, b, safeMod(term * invPepper, M));
                 }
 
-                // Step 2 Reverse
+                // Step 2 Reverse: Synced Phase Checking condition
                 for (let b = 0; b < numBlocks16; b++) {
-                    const shift = Number(((pepperBig * ivKeyInt128) * BigInt(b + 1)) % 22n);
-                    for (let i = 0; i < 128; i++) if (MARKERS.includes(((i % 22 - shift) % 22 + 22) % 22)) toggleBit(buf, b * 128 + i);
+                    const shift = Number(safeMod((pepperBig * ivKeyInt128) * BigInt(b + 1), 22n));
+                    for (let i = 0; i < 128; i++) if (MARKERS.includes(((i % 22) + shift) % 22)) toggleBit(buf, b * 128 + i);
                 }
 
-                // Step 1 Reverse
+                // Step 1 Reverse: Inversion rollback matching forward rules
+
                 for (let i = 0; i < totalBits; i++) if (MARKERS.includes(i % 22) && ivBits[i % 128] === 1) toggleBit(buf, i);
             }
-
 
             const padLen = buf[buf.length - 1];
             if (padLen >= 1 && padLen <= 128) buf = buf.slice(0, buf.length - padLen);
@@ -334,9 +362,9 @@
             document.getElementById('outputData').value = out;
         }
 
+
         async function handleDecrypt() {
             try {
-
                 const out = await decryptSEA256(
                     document.getElementById('inputData').value,
                     document.getElementById('userKey').value,
