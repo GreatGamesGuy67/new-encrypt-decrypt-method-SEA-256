@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SEA-256 Core Pipeline</title>
+    <style>
+        body { font-family: monospace; background: #0c0f12; color: #ced4da; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; color: #4dabf7; }
+        input, textarea { w_idth: 100%; box-sizing: border-box; background: #1a1f24; border: 1px solid #343a40; color: #fff; padding: 10px; font-family: monospace; }
+        button { background: #228be6; color: #fff; border: none; padding: 10px 20px; cursor: pointer; font-weight: bold; margin-right: 10px; }
+        button.decrypt { background: #12b886; }
+        button:hover { opacity: 0.9; }
+    </style>
+</head>
+<body>
+    <div class="container">
+
+        <h2>SEA-256 MASTER ENGINE PIPELINE</h2>
+        
+        <div class="group">
+            <label>Input Payload / Ciphertext Hex</label>
+            <textarea id="inputData" rows="4">The matrix requires 128-bit alignment for symmetric pipeline evaluation.</textarea>
+        </div>
+
+        <div class="group">
+            <label>User Key (256-bit password)</label>
+            <input id="userKey" type="text" value="master_engine_secret_passphrase_2026">
+        </div>
+
+        <div class="group">
+            <label>Secret Pepper</label>
+            <input id="pepper" type="text" value="987654321">
+        </div>
+
+        <div class="group">
+            <button onclick="handleEncrypt()">Run Encrypt Function</button>
+
+            <button class="decrypt" onclick="handleDecrypt()">Run Decrypt Function</button>
+        </div>
+
+        <div class="group">
+            <label>Pipeline Output Window</label>
+            <textarea id="outputData" rows="6" readonly></textarea>
+        </div>
+    </div>
+
+    <script>
+        // --- CONSTANTS & ARITHMETIC CORE ---
+        const M = (1n << 128n) - 159n; 
+        const MARKERS = [3, 7, 13, 19];
+        const MOD128 = 1n << 128n;
+
+        function gcd(a, b) {
+            while (b !== 0n) { let t = b; b = a % b; a = t; }
+            return a;
+        }
+
+
+        function modInverse(a, m) {
+            let m0 = m, y = 0n, x = 1n;
+            if (m === 1n) return 0n;
+            let currentA = a, currentM = m;
+            while (currentA > 1n) {
+                if (currentM === 0n) break;
+                let q = currentA / currentM;
+                let t = currentM; currentM = currentA % currentM; currentA = t;
+                t = y; y = x - q * y; x = t;
+            }
+            return x < 0n ? x + m0 : x;
+        }
+
+        // --- BIT FIELD UTILITIES ---
+        function getBit(arr, idx) { return (arr[Math.floor(idx / 8)] >> (7 - (idx % 8))) & 1; }
+        function setBit(arr, idx, val) {
+            const bIdx = Math.floor(idx / 8), bit = 7 - (idx % 8);
+            if (val === 1) arr[bIdx] |= (1 << bit); else arr[bIdx] &= ~(1 << bit);
+        }
+
+        function toggleBit(arr, idx) { arr[Math.floor(idx / 8)] ^= (1 << (7 - (idx % 8))); }
+        
+        function getBlock128(arr, bIdx) {
+            let val = 0n; const start = bIdx * 16;
+            for (let i = 0; i < 16; i++) val = (val << 8n) | BigInt(arr[start + i] || 0);
+            return val;
+        }
+        function setBlock128(arr, bIdx, val) {
+            const start = bIdx * 16; let t = val;
+            for (let i = 15; i >= 0; i--) { arr[start + i] = Number(t & 0xFFn); t >>= 8n; }
+        }
+
+        function getShuffleMap(seed, len = 128) {
+            let curr = seed % 2147483647n; if (curr === 0n) curr = 123456789n;
+            const next = () => { curr = (curr * 48271n) % 2147483647n; return Number(curr); };
+            let arr = Array.from({length: len}, (_, i) => i);
+            for (let i = len - 1; i > 0; i--) {
+                const j = next() % (i + 1);
+                let t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+
+            }
+            return arr;
+        }
+
+        function getAvalanchePositions(seed, total, count = 128) {
+            let curr = seed % 2147483647n; if (curr === 0n) curr = 987654321n;
+            const next = () => { curr = (curr * 48271n) % 2147483647n; return Number(curr); };
+            return Array.from({length: count}, () => next() % total);
+        }
+
+        async function hmacSign(key, data) {
+            const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+            return new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, data));
+        }
+
+        // ====================================================================
+        // STEP ENTRY POINT: ENCRYPT ENGINE PIPELINE
+        // ====================================================================
+        async function encryptSEA256(payloadStr, keyStr, ivBytes, pepperStr) {
+
+            const encoder = new TextEncoder();
+            let keyBytes = new Uint8Array(32); keyBytes.set(encoder.encode(keyStr).slice(0, 32));
+            
+            let rawData = encoder.encode(payloadStr);
+            const padLen = 128 - (rawData.length % 128);
+            let buf = new Uint8Array(rawData.length + padLen);
+            buf.set(rawData); buf.fill(padLen, rawData.length);
+
+            let pepperBig = 0n;
+            if(!isNaN(parseInt(pepperStr))) pepperBig = BigInt(parseInt(pepperStr));
+            else for(let i=0; i<pepperStr.length; i++) pepperBig += BigInt(pepperStr.charCodeAt(i));
+
+            if (gcd(pepperBig, M) !== 1n || pepperBig === 0n) pepperBig += 1n;
+
+            let ivInt = 0n; for(let i=0; i<16; i++) ivInt = (ivInt << 8n) | BigInt(ivBytes[i]);
+            let keyInt = 0n; for(let i=0; i<32; i++) keyInt = (keyInt << 8n) | BigInt(keyBytes[i]);
+            let keySlices = [keyInt >> 128n, keyInt & ((1n << 128n) - 1n)];
+
+            const totalBits = buf.length * 8;
+
+            const ivBits = []; for(let i=0; i<16; i++) for(let b=7; b>=0; b--) ivBits.push((ivBytes[i] >> b) & 1);
+            const controlBits = []; for(let i=0; i<32; i++) for(let b=7; b>=0; b--) controlBits.push(((keyBytes[i] ^ ivBytes[i % 16]) >> b) & 1);
+
+            const numBlocks16 = buf.length / 16;
+            const numBlocks128 = buf.length / 128;
+            const ivKeyInt128 = keySlices[0] ^ ivInt;
+
+            for (let r = 0; r < 8; r++) {
+                // Step 1
+                for (let i = 0; i < totalBits; i++) if (MARKERS.includes(i % 22) && ivBits[i % 128] === 1) toggleBit(buf, i);
+                
+                // Step 2
+                for (let b = 0; b < numBlocks16; b++) {
+                    const shift = Number(((pepperBig * ivKeyInt128) * BigInt(b + 1)) % 22n);
+                    for (let i = 0; i < 128; i++) if (MARKERS.includes((i % 22 + shift) % 22)) toggleBit(buf, b * 128 + i);
+                }
+                
+                // Steps 3 & 4
+                for (let b = 0; b < numBlocks16; b++) {
+
+                    let X = getBlock128(buf, b);
+                    let Y = ((X * pepperBig) + (keySlices[b % 2] ^ ivInt)) % M;
+                    setBlock128(buf, b, (~Y) & (MOD128 - 1n));
+                }
+                
+                // Step 5
+                for (let b = 0; b < numBlocks128; b++) {
+                    const map = getShuffleMap(pepperBig + ivInt + BigInt(b + r), 128);
+                    const chunk = buf.slice(b * 128, (b + 1) * 128);
+                    for (let i = 0; i < 128; i++) buf[b * 128 + map[i]] = chunk[i];
+                }
+                
+                // Step 6
+                for (let b = 0; b < numBlocks16; b++) {
+                    let d = getBlock128(buf, b);
+                    let m = (d + keySlices[1] - pepperBig) % MOD128;
+                    setBlock128(buf, b, m < 0n ? m + MOD128 : m);
+                    toggleBit(buf, b * 128 + Number((BigInt(keyBytes[b % 32] ^ ivBytes[b % 16]) * pepperBig) % 128n));
+                }
+
+                
+                // Step 7
+                const pos = getAvalanchePositions(keyInt ^ ivInt ^ BigInt(r), totalBits, 128);
+                for (let p = 0; p < pos.length; p++) {
+                    let val = BigInt(getBit(buf, pos[p])) + pepperBig;
+                    for (let l = 0; l < 300; l++) val = (~(((val ^ pepperBig) * 8n) + pepperBig)) & (MOD128 - 1n);
+                    const mBytes = new Uint8Array(16); let tv = val;
+                    for (let i = 15; i >= 0; i--) { mBytes[i] = Number(tv & 0xFFn); tv >>= 8n; }
+                    const startByte = Math.floor(pos[p] / 128) * 16;
+                    for (let i = 0; i < 16; i++) buf[startByte + i] ^= mBytes[i];
+                }
+                
+                // Step 8
+                const interval = pepperBig * 3n;
+                for (let i = 0; i < totalBits; i += 4) {
+                    const ctrl = controlBits[Number((BigInt(i) * interval) % BigInt(controlBits.length))];
+                    let b0 = getBit(buf, i), b1 = getBit(buf, i+1), b2 = getBit(buf, i+2), b3 = getBit(buf, i+3);
+                    if (ctrl === 0) { setBit(buf, i, b1); setBit(buf, i+1, b2); setBit(buf, i+2, b3); setBit(buf, i+3, b0); }
+                    else { setBit(buf, i, b3); setBit(buf, i+1, b0); setBit(buf, i+2, b1); setBit(buf, i+3, b2); }
+
+                }
+            }
+
+            let layout = new Uint8Array(32 + 16 + buf.length);
+            layout.set(ivBytes, 32); layout.set(buf, 48);
+            let hmac = await hmacSign(keyBytes, layout.slice(32)); layout.set(hmac, 0);
+            return Array.from(layout).map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+
+        // ====================================================================
+        // STEP ENTRY POINT: DECRYPT ENGINE PIPELINE
+        // ====================================================================
+        async function decryptSEA256(combinedHex, keyStr, pepperStr) {
+            const rawHex = combinedHex.trim().replace(/^0x/i, '');
+            const fullBuf = new Uint8Array(rawHex.length / 2);
+            for (let i = 0; i < fullBuf.length; i++) fullBuf[i] = parseInt(rawHex.substr(i * 2, 2), 16);
+
+            const encoder = new TextEncoder();
+            let keyBytes = new Uint8Array(32); keyBytes.set(encoder.encode(keyStr).slice(0, 32));
+
+            const ivBytes = fullBuf.slice(32, 48);
+            let buf = fullBuf.slice(48);
+
+            let pepperBig = 0n;
+            if(!isNaN(parseInt(pepperStr))) pepperBig = BigInt(parseInt(pepperStr));
+            else for(let i=0; i<pepperStr.length; i++) pepperBig += BigInt(pepperStr.charCodeAt(i));
+            if (gcd(pepperBig, M) !== 1n || pepperBig === 0n) pepperBig += 1n;
+
+            const invPepper = modInverse(pepperBig, M);
+            let ivInt = 0n; for(let i=0; i<16; i++) ivInt = (ivInt << 8n) | BigInt(ivBytes[i]);
+            let keyInt = 0n; for(let i=0; i<32; i++) keyInt = (keyInt << 8n) | BigInt(keyBytes[i]);
+            let keySlices = [keyInt >> 128n, keyInt & ((1n << 128n) - 1n)];
+
+            const totalBits = buf.length * 8;
+            const ivBits = []; for(let i=0; i<16; i++) for(let b=7; b>=0; b--) ivBits.push((ivBytes[i] >> b) & 1);
+            const controlBits = []; for(let i=0; i<32; i++) for(let b=7; b>=0; b--) controlBits.push(((keyBytes[i] ^ ivBytes[i % 16]) >> b) & 1);
+
+            const numBlocks16 = buf.length / 16;
+            const numBlocks128 = buf.length / 128;
+
+            const ivKeyInt128 = keySlices[0] ^ ivInt;
+
+            for (let r = 7; r >= 0; r--) {
+                // Step 8 Reverse
+                const interval = pepperBig * 3n;
+                for (let i = totalBits - 4; i >= 0; i -= 4) {
+                    const ctrl = controlBits[Number((BigInt(i) * interval) % BigInt(controlBits.length))];
+                    let b0 = getBit(buf, i), b1 = getBit(buf, i+1), b2 = getBit(buf, i+2), b3 = getBit(buf, i+3);
+                    if (ctrl === 0) { setBit(buf, i, b3); setBit(buf, i+1, b0); setBit(buf, i+2, b1); setBit(buf, i+3, b2); }
+                    else { setBit(buf, i, b0); setBit(buf, i+1, b1); setBit(buf, i+2, b2); setBit(buf, i+3, b3); }
+                }
+
+                // Step 7 Reverse
+                const pos = getAvalanchePositions(keyInt ^ ivInt ^ BigInt(r), totalBits, 128);
+                for (let p = pos.length - 1; p >= 0; p--) {
+                    let val = BigInt(getBit(buf, pos[p])) + pepperBig;
+                    for (let l = 0; l < 300; l++) val = (~(((val ^ pepperBig) * 8n) + pepperBig)) & (MOD128 - 1n);
+                    const mBytes = new Uint8Array(16); let tv = val;
+                    for (let i = 15; i >= 0; i--) { mBytes[i] = Number(tv & 0xFFn); tv >>= 8n; }
+
+                    const startByte = Math.floor(pos[p] / 128) * 16;
+                    for (let i = 0; i < 16; i++) buf[startByte + i] ^= mBytes[i];
+                }
+
+                // Step 6 Reverse
+                for (let b = 0; b < numBlocks16; b++) {
+                    toggleBit(buf, b * 128 + Number((BigInt(keyBytes[b % 32] ^ ivBytes[b % 16]) * pepperBig) % 128n));
+                    let m = getBlock128(buf, b);
+                    let d = (m - keySlices[1] + pepperBig) % MOD128;
+                    setBlock128(buf, b, d < 0n ? d + MOD128 : d);
+                }
+
+                // Step 5 Reverse
+                for (let b = numBlocks128 - 1; b >= 0; b--) {
+                    const map = getShuffleMap(pepperBig + ivInt + BigInt(b + r), 128);
+                    const chunk = buf.slice(b * 128, (b + 1) * 128);
+                    for (let i = 0; i < 128; i++) buf[b * 128 + i] = chunk[map[i]];
+                }
+
+
+                // Steps 3 & 4 Reverse
+                for (let b = 0; b < numBlocks16; b++) {
+                    let fb = getBlock128(buf, b);
+                    let Y = (~fb) & (MOD128 - 1n);
+                    let term = (Y - (keySlices[b % 2] ^ ivInt)) % M;
+                    if (term < 0n) term += M;
+                    setBlock128(buf, b, (term * invPepper) % M);
+                }
+
+                // Step 2 Reverse
+                for (let b = 0; b < numBlocks16; b++) {
+                    const shift = Number(((pepperBig * ivKeyInt128) * BigInt(b + 1)) % 22n);
+                    for (let i = 0; i < 128; i++) if (MARKERS.includes(((i % 22 - shift) % 22 + 22) % 22)) toggleBit(buf, b * 128 + i);
+                }
+
+                // Step 1 Reverse
+                for (let i = 0; i < totalBits; i++) if (MARKERS.includes(i % 22) && ivBits[i % 128] === 1) toggleBit(buf, i);
+            }
+
+
+            const padLen = buf[buf.length - 1];
+            if (padLen >= 1 && padLen <= 128) buf = buf.slice(0, buf.length - padLen);
+            return new TextDecoder().decode(buf);
+        }
+
+        // --- BUTTON HANDLING WRAPPERS ---
+        async function handleEncrypt() {
+            const iv = crypto.getRandomValues(new Uint8Array(16));
+            const out = await encryptSEA256(
+                document.getElementById('inputData').value,
+                document.getElementById('userKey').value,
+                iv,
+                document.getElementById('pepper').value
+            );
+            document.getElementById('outputData').value = out;
+        }
+
+        async function handleDecrypt() {
+            try {
+
+                const out = await decryptSEA256(
+                    document.getElementById('inputData').value,
+                    document.getElementById('userKey').value,
+                    document.getElementById('pepper').value
+                );
+                document.getElementById('outputData').value = out;
+            } catch(e) {
+                document.getElementById('outputData').value = "[DECRYPTION CRASH] Verify layout hex alignment integrity.";
+            }
+        }
+    </script>
+</body>
+</html>
