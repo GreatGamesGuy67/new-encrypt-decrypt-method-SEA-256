@@ -9,7 +9,7 @@
         .container { max-width: 800px; margin: 0 auto; }
         .group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; color: #4dabf7; }
-        input, textarea { w_idth: 100%; box-sizing: border-box; background: #1a1f24; border: 1px solid #343a40; color: #fff; padding: 10px; font-family: monospace; }
+        input, textarea { width: 100%; box-sizing: border-box; background: #1a1f24; border: 1px solid #343a40; color: #fff; padding: 10px; font-family: monospace; }
         button { background: #228be6; color: #fff; border: none; padding: 10px 20px; cursor: pointer; font-weight: bold; margin-right: 10px; }
         button.decrypt { background: #12b886; }
         button:hover { opacity: 0.9; }
@@ -114,6 +114,13 @@
             return new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, data));
         }
 
+        function constantTimeEqual(a, b) {
+            if (a.length !== b.length) return false;
+            let res = 0;
+            for (let i = 0; i < a.length; i++) res |= a[i] ^ b[i];
+            return res === 0;
+        }
+
         // ====================================================================
         // STEP ENTRY POINT: ENCRYPT ENGINE PIPELINE
         // ====================================================================
@@ -142,8 +149,8 @@
             const ivBits = []; for(let i=0; i<16; i++) for(let b=7; b>=0; b--) ivBits.push((ivBytes[i] >> b) & 1);
             const controlBits = []; for(let i=0; i<32; i++) for(let b=7; b>=0; b--) controlBits.push(((keyBytes[i] ^ ivBytes[i % 16]) >> b) & 1);
 
-            const numBlocks16 = buf.length / 16;
-            const numBlocks128 = buf.length / 128;
+            const numBlocks16 = Math.floor(buf.length / 16);
+            const numBlocks128 = Math.floor(buf.length / 128);
             const ivKeyInt128 = keySlices[0] ^ ivInt;
 
             for (let r = 0; r < 8; r++) {
@@ -213,14 +220,25 @@
         // ====================================================================
         async function decryptSEA256(combinedHex, keyStr, pepperStr) {
             const rawHex = combinedHex.trim().replace(/^0x/i, '');
+            if (rawHex.length === 0) throw new Error('No input provided to decrypt');
+            if (rawHex.length % 2 !== 0) throw new Error('Hex input length must be even');
+
             const fullBuf = new Uint8Array(rawHex.length / 2);
             for (let i = 0; i < fullBuf.length; i++) fullBuf[i] = parseInt(rawHex.substr(i * 2, 2), 16);
+
+            if (fullBuf.length < 48) throw new Error('Input is too short to contain HMAC + IV + ciphertext');
 
             const encoder = new TextEncoder();
             let keyBytes = new Uint8Array(32); keyBytes.set(encoder.encode(keyStr).slice(0, 32));
 
-            const ivBytes = fullBuf.slice(32, 48);
-            let buf = fullBuf.slice(48);
+            // Verify HMAC before attempting to decrypt
+            const hmacFromLayout = fullBuf.slice(0, 32);
+            const rest = fullBuf.slice(32);
+            const expected = await hmacSign(keyBytes, rest);
+            if (!constantTimeEqual(expected, hmacFromLayout)) throw new Error('HMAC verification failed — wrong key/pepper or tampered data');
+
+            const ivBytes = rest.slice(0, 16);
+            let buf = rest.slice(16);
 
             let pepperBig = 0n;
             if(!isNaN(parseInt(pepperStr))) pepperBig = BigInt(parseInt(pepperStr));
@@ -236,8 +254,8 @@
             const ivBits = []; for(let i=0; i<16; i++) for(let b=7; b>=0; b--) ivBits.push((ivBytes[i] >> b) & 1);
             const controlBits = []; for(let i=0; i<32; i++) for(let b=7; b>=0; b--) controlBits.push(((keyBytes[i] ^ ivBytes[i % 16]) >> b) & 1);
 
-            const numBlocks16 = buf.length / 16;
-            const numBlocks128 = buf.length / 128;
+            const numBlocks16 = Math.floor(buf.length / 16);
+            const numBlocks128 = Math.floor(buf.length / 128);
 
             const ivKeyInt128 = keySlices[0] ^ ivInt;
 
@@ -326,7 +344,7 @@
                 );
                 document.getElementById('outputData').value = out;
             } catch(e) {
-                document.getElementById('outputData').value = "[DECRYPTION CRASH] Verify layout hex alignment integrity.";
+                document.getElementById('outputData').value = "[DECRYPTION ERROR] " + (e && e.message ? e.message : String(e));
             }
         }
     </script>
